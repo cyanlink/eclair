@@ -626,7 +626,7 @@ class IntegrationSpec extends TestKit(ActorSystem("test")) with BitcoindService 
     awaitCond(nodes("C").nodeParams.db.audit.listRelayed(start, Platform.currentTime).exists(_.paymentHash == pr.paymentHash))
     val relayed = nodes("C").nodeParams.db.audit.listRelayed(start, Platform.currentTime).filter(_.paymentHash == pr.paymentHash).head
     assert(relayed.amountIn - relayed.amountOut > 0.msat, relayed)
-    assert(relayed.amountIn - relayed.amountOut < 300000.msat, relayed)
+    assert(relayed.amountIn - relayed.amountOut < 300000.msat, s"Relayed=$relayed, Sent=$paymentSent, Received=${nodes("B").nodeParams.db.payments.getIncomingPayment(pr.paymentHash)}")
 
     val outgoingSuccess = nodes("D").nodeParams.db.payments.listOutgoingPayments(paymentId).filter(p => p.status.isInstanceOf[OutgoingPaymentStatus.Succeeded])
     outgoingSuccess.foreach { case p@OutgoingPayment(_, _, _, _, _, _, _, recipientNodeId, _, _, OutgoingPaymentStatus.Succeeded(_, _, route, _)) =>
