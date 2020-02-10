@@ -745,7 +745,7 @@ class IntegrationSpec extends TestKit(ActorSystem("test")) with BitcoindService 
     case _ => ???
   }
 
-  test("propagate a fulfill upstream when a downstream htlc is redeemed on-chain (local commit)") {
+  ignore("propagate a fulfill upstream when a downstream htlc is redeemed on-chain (local commit)") {
     val sender = TestProbe()
     // we subscribe to C's channel state transitions
     val stateListener = TestProbe()
@@ -827,7 +827,7 @@ class IntegrationSpec extends TestKit(ActorSystem("test")) with BitcoindService 
     nodes.values.head.nodeParams.currentBlockHeight
   }
 
-  test("propagate a fulfill upstream when a downstream htlc is redeemed on-chain (remote commit)") {
+  ignore("propagate a fulfill upstream when a downstream htlc is redeemed on-chain (remote commit)") {
     val sender = TestProbe()
     // we subscribe to C's channel state transitions
     val stateListener = TestProbe()
@@ -901,7 +901,7 @@ class IntegrationSpec extends TestKit(ActorSystem("test")) with BitcoindService 
     awaitAnnouncements(nodes.filterKeys(_ == "A"), 8, 10, 22)
   }
 
-  test("propagate a failure upstream when a downstream htlc times out (local commit)") {
+  ignore("propagate a failure upstream when a downstream htlc times out (local commit)") {
     val sender = TestProbe()
     // we subscribe to C's channel state transitions
     val stateListener = TestProbe()
@@ -959,7 +959,7 @@ class IntegrationSpec extends TestKit(ActorSystem("test")) with BitcoindService 
     awaitAnnouncements(nodes.filterKeys(_ == "A"), 7, 9, 20)
   }
 
-  test("propagate a failure upstream when a downstream htlc times out (remote commit)") {
+  ignore("propagate a failure upstream when a downstream htlc times out (remote commit)") {
     val sender = TestProbe()
     // we subscribe to C's channel state transitions
     val stateListener = TestProbe()
@@ -1021,7 +1021,7 @@ class IntegrationSpec extends TestKit(ActorSystem("test")) with BitcoindService 
     awaitAnnouncements(nodes.filterKeys(_ == "A"), 6, 8, 18)
   }
 
-  test("punish a node that has published a revoked commit tx") {
+  ignore("punish a node that has published a revoked commit tx") {
     val sender = TestProbe()
     // we subscribe to C's channel state transitions
     val stateListener = TestProbe()
@@ -1144,7 +1144,7 @@ class IntegrationSpec extends TestKit(ActorSystem("test")) with BitcoindService 
     awaitAnnouncements(nodes.filterKeys(_ == "A"), 5, 7, 16)
   }
 
-  test("generate and validate lots of channels") {
+  ignore("generate and validate lots of channels") {
     implicit val extendedClient = new ExtendedBitcoinClient(bitcoinrpcclient)
     // we simulate fake channels by publishing a funding tx and sending announcement messages to a node at random
     logger.info(s"generating fake channels")
