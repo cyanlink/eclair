@@ -48,11 +48,12 @@
     <logger name="fr.acinq.eclair.Diagnostics" level="OFF"/>
     <logger name="fr.acinq.eclair.blockchain.bitcoind.ZmqWatcher" level="OFF"/>
     <logger name="fr.acinq.eclair.db.BackupHandler" level="OFF"/>
+    <logger name="fr.acinq.eclair.payment" level="DEBUG"/>
 
-    <root level="INFO">
+    <root level="WARN">
         <!--appender-ref ref="FILE"/>
-        <appender-ref ref="CONSOLEWARN"/>
-        <appender-ref ref="CONSOLE"/-->
+        <appender-ref ref="CONSOLEWARN"/>-->
+        <appender-ref ref="CONSOLE"/>
     </root>
 
 </configuration>
