@@ -118,6 +118,7 @@ class Setup(datadir: File,
 
   val feeEstimator = new FeeEstimator {
     override def getFeeratePerKb(target: Int): Long = feeratesPerKB.get().feePerBlock(target)
+
     override def getFeeratePerKw(target: Int): Long = feeratesPerKw.get().feePerBlock(target)
   }
 
@@ -164,9 +165,14 @@ class Setup(datadir: File,
           case "testnet" => bitcoinClient.invoke("getrawtransaction", "8f38a0dd41dc0ae7509081e262d791f8d53ed6f884323796d5ec7b0966dd3825") // coinbase of #1500000
           case "regtest" => Future.successful(())
         }
-      } yield (progress, ibd, chainHash, bitcoinVersion, unspentAddresses, blocks, headers)
+        (zmqBlocksAddress_opt, zmqTxsAddress_opt) <- bitcoinClient.invoke("getzmqnotifications").collect { case JArray(zmqInfos) =>
+          val blocksAddress_opt = zmqInfos.find(_ \ "type" == JString("pubrawblock")).map(_.\("address").extract[String])
+          val txsAddress_opt = zmqInfos.find(_ \ "type" == JString("pubrawtx")).map(_.\("address").extract[String])
+          (blocksAddress_opt, txsAddress_opt)
+        }
+      } yield (progress, ibd, chainHash, bitcoinVersion, unspentAddresses, blocks, headers, zmqBlocksAddress_opt, zmqTxsAddress_opt)
       // blocking sanity checks
-      val (progress, initialBlockDownload, chainHash, bitcoinVersion, unspentAddresses, blocks, headers) = await(future, 30 seconds, "bicoind did not respond after 30 seconds")
+      val (progress, initialBlockDownload, chainHash, bitcoinVersion, unspentAddresses, blocks, headers, zmqBlocksAddress_opt, zmqTxsAddress_opt) = await(future, 30 seconds, "bicoind did not respond after 30 seconds")
       assert(bitcoinVersion >= 170000, "Eclair requires Bitcoin Core 0.17.0 or higher")
       assert(chainHash == nodeParams.chainHash, s"chainHash mismatch (conf=${nodeParams.chainHash} != bitcoind=$chainHash)")
       if (chainHash != Block.RegtestGenesisBlock.hash) {
@@ -175,7 +181,8 @@ class Setup(datadir: File,
       assert(!initialBlockDownload, s"bitcoind should be synchronized (initialblockdownload=$initialBlockDownload)")
       assert(progress > 0.999, s"bitcoind should be synchronized (progress=$progress)")
       assert(headers - blocks <= 1, s"bitcoind should be synchronized (headers=$headers blocks=$blocks)")
-      Bitcoind(bitcoinClient)
+      assert(zmqBlocksAddress_opt.isDefined && zmqTxsAddress_opt.isDefined, "bitcoind should have zeromq enabled")
+      Bitcoind(bitcoinClient, zmqBlocksAddress_opt.get, zmqTxsAddress_opt.get)
     case ELECTRUM =>
       val addresses = config.hasPath("electrum") match {
         case true =>
@@ -183,10 +190,10 @@ class Setup(datadir: File,
           val port = config.getInt("electrum.port")
           val address = InetSocketAddress.createUnresolved(host, port)
           val ssl = config.getString("electrum.ssl") match {
-              case _ if address.getHostName.endsWith(".onion") => SSL.OFF // Tor already adds end-to-end encryption, adding TLS on top doesn't add anything
-              case "off" => SSL.OFF
-              case "loose" => SSL.LOOSE
-              case _ => SSL.STRICT // strict mode is the default when we specify a custom electrum server, we don't want to be MITMed
+            case _ if address.getHostName.endsWith(".onion") => SSL.OFF // Tor already adds end-to-end encryption, adding TLS on top doesn't add anything
+            case "off" => SSL.OFF
+            case "loose" => SSL.LOOSE
+            case _ => SSL.STRICT // strict mode is the default when we specify a custom electrum server, we don't want to be MITMed
           }
 
           logger.info(s"override electrum default with server=$address ssl=$ssl")
@@ -233,7 +240,7 @@ class Setup(datadir: File,
       readTimeout = FiniteDuration(config.getDuration("feerate-provider-timeout", TimeUnit.MILLISECONDS), TimeUnit.MILLISECONDS)
       feeProvider = (nodeParams.chainHash, bitcoin) match {
         case (Block.RegtestGenesisBlock.hash, _) => new FallbackFeeProvider(new ConstantFeeProvider(defaultFeerates) :: Nil, minFeeratePerByte)
-        case (_, Bitcoind(bitcoinClient)) =>
+        case (_, Bitcoind(bitcoinClient, _, _)) =>
           new FallbackFeeProvider(new SmoothFeeProvider(new BitcoinCoreFeeProvider(bitcoinClient, defaultFeerates), smoothFeerateWindow) :: new SmoothFeeProvider(new BitgoFeeProvider(nodeParams.chainHash, readTimeout), smoothFeerateWindow) :: new SmoothFeeProvider(new EarnDotComFeeProvider(readTimeout), smoothFeerateWindow) :: new ConstantFeeProvider(defaultFeerates) :: Nil, minFeeratePerByte) // order matters!
         case _ =>
           new FallbackFeeProvider(new SmoothFeeProvider(new BitgoFeeProvider(nodeParams.chainHash, readTimeout), smoothFeerateWindow) :: new SmoothFeeProvider(new EarnDotComFeeProvider(readTimeout), smoothFeerateWindow) :: new ConstantFeeProvider(defaultFeerates) :: Nil, minFeeratePerByte) // order matters!
@@ -247,24 +254,11 @@ class Setup(datadir: File,
           feeratesRetrieved.trySuccess(Done)
       })
       _ <- feeratesRetrieved.future
-      (zmqBlocks_opt, zmqTxs_opt) <- bitcoin match {
-        case Bitcoind(client) => client.invoke("getzmqnotifications").map {
-          case JArray(zmqInfos) =>
-            val blocksAddress = zmqInfos.find(_ \ "type" == JString("pubrawblock")).map(_.\("address").extract[String])
-            val txsAddress = zmqInfos.find(_ \ "type" == JString("pubrawtx")).map(_.\("address").extract[String])
-            if(blocksAddress.isEmpty || txsAddress.isEmpty){
-              throw new IllegalArgumentException("Unable to get zmq addresses, please make sure ZMQ is enabled in bitcoin.conf")
-            }
-            (blocksAddress, txsAddress)
-          case _ => throw new IllegalArgumentException("Unable to get zmq addresses, please make sure ZMQ is enabled in bitcoin.conf")
-        }
-        case _ => Future.successful((None, None))
-      }
 
       watcher = bitcoin match {
-        case Bitcoind(bitcoinClient) =>
-          system.actorOf(SimpleSupervisor.props(Props(new ZMQActor(zmqBlocks_opt.get, Some(zmqBlockConnected))), "zmqblock", SupervisorStrategy.Restart))
-          system.actorOf(SimpleSupervisor.props(Props(new ZMQActor(zmqTxs_opt.get, Some(zmqTxConnected))), "zmqtx", SupervisorStrategy.Restart))
+        case Bitcoind(bitcoinClient, zmqBlocksAddress, zmqTxsAddress) =>
+          system.actorOf(SimpleSupervisor.props(Props(new ZMQActor(zmqBlocksAddress, Some(zmqBlockConnected))), "zmqblock", SupervisorStrategy.Restart))
+          system.actorOf(SimpleSupervisor.props(Props(new ZMQActor(zmqTxsAddress, Some(zmqTxConnected))), "zmqtx", SupervisorStrategy.Restart))
           system.actorOf(SimpleSupervisor.props(ZmqWatcher.props(blockCount, new ExtendedBitcoinClient(new BatchingBitcoinJsonRPCClient(bitcoinClient))), "watcher", SupervisorStrategy.Resume))
         case Electrum(electrumClient) =>
           zmqBlockConnected.success(Done)
@@ -277,7 +271,7 @@ class Setup(datadir: File,
       _ <- Future.firstCompletedOf(routerInitialized.future :: routerTimeout :: Nil)
 
       wallet = bitcoin match {
-        case Bitcoind(bitcoinClient) => new BitcoinCoreWallet(bitcoinClient)
+        case Bitcoind(bitcoinClient, _, _) => new BitcoinCoreWallet(bitcoinClient)
         case Electrum(electrumClient) =>
           val sqlite = DriverManager.getConnection(s"jdbc:sqlite:${new File(chaindir, "wallet.sqlite")}")
           val walletDb = new SqliteWalletDb(sqlite)
@@ -372,7 +366,7 @@ class Setup(datadir: File,
 
 // @formatter:off
 sealed trait Bitcoin
-case class Bitcoind(bitcoinClient: BasicBitcoinJsonRPCClient) extends Bitcoin
+case class Bitcoind(bitcoinClient: BasicBitcoinJsonRPCClient, zmqBlocksAddress: String, zmqTxsAddress: String) extends Bitcoin
 case class Electrum(electrumClient: ActorRef) extends Bitcoin
 // @formatter:on
 
