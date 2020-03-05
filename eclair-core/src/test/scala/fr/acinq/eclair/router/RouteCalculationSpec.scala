@@ -17,19 +17,21 @@
 package fr.acinq.eclair.router
 
 import fr.acinq.bitcoin.Crypto.PublicKey
-import fr.acinq.bitcoin.{Block, Btc, ByteVector32, ByteVector64, Satoshi}
+import fr.acinq.bitcoin.{Block, ByteVector32, ByteVector64, Satoshi}
 import fr.acinq.eclair.payment.PaymentRequest.ExtraHop
 import fr.acinq.eclair.router.Graph.GraphStructure.DirectedGraph.graphEdgeToHop
 import fr.acinq.eclair.router.Graph.GraphStructure.{DirectedGraph, GraphEdge}
 import fr.acinq.eclair.router.Graph.{RichWeight, WeightRatios}
 import fr.acinq.eclair.transactions.Transactions
 import fr.acinq.eclair.wire._
-import fr.acinq.eclair.{CltvExpiryDelta, LongToBtcAmount, MilliSatoshi, ShortChannelId, ToMilliSatoshiConversion, randomKey}
+import fr.acinq.eclair.{CltvExpiryDelta, LongToBtcAmount, MilliSatoshi, ShortChannelId, ToMilliSatoshiConversion, nodeFee, randomKey}
+import org.scalacheck.Gen
+import org.scalatest.prop.GeneratorDrivenPropertyChecks
 import org.scalatest.{FunSuite, ParallelTestExecution}
 import scodec.bits._
 
 import scala.collection.immutable.SortedMap
-import scala.util.{Failure, Success}
+import scala.util.{Failure, Random, Success}
 
 /**
  * Created by PM on 31/05/2016.
@@ -923,6 +925,116 @@ class RouteCalculationSpec extends FunSuite with ParallelTestExecution {
     assert(route.size == 2)
     assert(route.last.nextNodeId == targetNode)
   }
+}
+
+class RouteCalculationFuzzSpec extends FunSuite with GeneratorDrivenPropertyChecks with ParallelTestExecution {
+
+  import RouteCalculationSpec._
+
+  // TODO: properties:
+  //  - a route can be taken in both directions -> maybe need a generator for a route then?
+  //  - if I can find a route to A and A is connected to B, I can find a route to B? Something about route lengths to express that?
+
+  // Generate those only once, it's a waste to re-generate keys constantly.
+  val nodeIds = (1 to 500).map(_ => randomKey.publicKey).toList
+
+  case class ChannelFees(feeBase: MilliSatoshi, feeProp: Long, expiryDelta: CltvExpiryDelta)
+
+  case class ChannelParams(capacity: Satoshi, fees1: ChannelFees, fees2: ChannelFees)
+
+  val feesGen = for {
+    base <- Gen.choose(0, 5000).map(MilliSatoshi(_))
+    prop <- Gen.choose(10, 1000)
+    expiryDelta <- Gen.choose(9, 144).map(CltvExpiryDelta)
+  } yield ChannelFees(base, prop, expiryDelta)
+
+  val paramsGen = for {
+    capacity <- Gen.choose(10000, 100000000).map(Satoshi(_))
+    fees1 <- feesGen
+    fees2 <- feesGen
+  } yield ChannelParams(capacity, fees1, fees2)
+
+  // Generate a small-world graph based on the Watts–Strogatz model (https://en.wikipedia.org/wiki/Watts-Strogatz_model).
+  // TODO: add another one for hub-and-spoke graphs
+  val smallWorldGraphGen: Gen[DirectedGraph] = for {
+    nodes <- Gen.choose(100, 500)
+    meanHalfDegree <- Gen.choose(5, 25)
+    beta <- Gen.choose(0, nodes)
+    // Start by connecting to neighbours on both sides.
+    // NB: to form a ring, we need to wrap the end of the list with the beginning.
+    edges = (nodeIds.take(nodes) ++ nodeIds.take(meanHalfDegree - 1))
+      .sliding(meanHalfDegree)
+      .flatMap(neighbours => {
+        val node1 = neighbours.head
+        neighbours.tail.map(node2 => {
+          // Then randomly rewire.
+          val r = Random.nextInt(nodes)
+          if (r <= beta && nodeIds(r) != node1) {
+            (node1, nodeIds(r))
+          } else {
+            (node1, node2)
+          }
+        })
+      }).zipWithIndex.map {
+      case ((node1, node2), scid) => makeChannel(scid, node1, node2)
+    }.toList
+    channelParams <- Gen.listOfN(edges.length, paramsGen)
+    channels = SortedMap(edges.zip(channelParams).map { case (ann, ChannelParams(capacity, f1, f2)) =>
+      ann.shortChannelId -> PublicChannel(
+        ann,
+        ByteVector32.Zeroes,
+        capacity,
+        Some(ChannelUpdate(ByteVector64.Zeroes, ByteVector32.Zeroes, ann.shortChannelId, 0, 1.toByte, 0.toByte, f1.expiryDelta, 1 msat, f1.feeBase, f1.feeProp, Some(capacity.toMilliSatoshi))),
+        Some(ChannelUpdate(ByteVector64.Zeroes, ByteVector32.Zeroes, ann.shortChannelId, 0, 1.toByte, 1.toByte, f2.expiryDelta, 1 msat, f2.feeBase, f2.feeProp, Some(capacity.toMilliSatoshi)))
+      )
+    }: _ *)
+  } yield DirectedGraph.makeGraph(channels)
+
+  val paymentGen = for {
+    g <- smallWorldGraphGen
+    source <- Gen.oneOf(g.vertexSet())
+    target <- Gen.oneOf(g.vertexSet() - source)
+    amount <- Gen.choose(1, 100000).map(Satoshi(_).toMilliSatoshi)
+  } yield (g, source, target, amount)
+
+  test("tiny amount") {
+    forAll(paymentGen) { case (g, source, target, _) =>
+      val amount = 1 msat
+      val route = Router.findRoute(g, source, target, amount, 3, Set.empty, Set.empty, Set.empty, DEFAULT_ROUTE_PARAMS, 4000)
+      whenever(route.isSuccess) {
+        assert(route.get.nonEmpty)
+      }
+    }
+  }
+
+  test("maximum fees") {
+    forAll(paymentGen, minSuccessful(500)) { case (g, source, target, amount) =>
+      val routeParams = RouteParams(randomize = false, 10000 msat, 0.03, 6, CltvExpiryDelta(500), None)
+      val route = Router.findRoute(g, source, target, amount, 1, Set.empty, Set.empty, Set.empty, routeParams, 4000)
+      whenever(route.isSuccess) {
+        val toSend = route.get.tail.foldLeft(amount) {
+          case (amount, h) =>
+            val amount1 = amount + nodeFee(h.lastUpdate.feeBaseMsat, h.lastUpdate.feeProportionalMillionths, amount)
+            assert(amount1 <= h.lastUpdate.htlcMaximumMsat.get, "channel capacity is lower than HTLC amount")
+            amount1
+        }
+        val totalFee = toSend - amount
+        assert(totalFee <= routeParams.maxFeeBase || totalFee <= amount * routeParams.maxFeePct)
+      }
+    }
+  }
+
+  test("cycles") {
+    forAll(paymentGen, minSuccessful(500)) { case (g, source, target, amount) =>
+      val route = Router.findRoute(g, source, target, amount, 3, Set.empty, Set.empty, Set.empty, DEFAULT_ROUTE_PARAMS, 4000)
+      whenever(route.isSuccess) {
+        assert(source === route.get.head.nodeId)
+        val nodes = source +: route.get.map(_.nextNodeId)
+        assert(nodes.toSet.size === nodes.size)
+      }
+    }
+  }
+
 }
 
 object RouteCalculationSpec {
